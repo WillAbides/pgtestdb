@@ -62,6 +62,10 @@ type Config struct {
 	// pgtestdb will be unable to drop the database, and the test will be failed
 	// with a warning.
 	ForceTerminateConnections bool
+	// Logf is where the connection string will be logged if it is created
+	// successfully.  Default is t.Logf in [New] and [Custom]. Otherwise, no
+	// logging is done unless Logf is set.
+	Logf func(string, ...any)
 }
 
 // Role contains the details of a postgres role (user) that will be used
@@ -144,8 +148,21 @@ type TB interface {
 // a database for tests, benchmarks, and fuzzes.
 func New(t TB, conf Config, migrator Migrator) *sql.DB {
 	t.Helper()
-	_, db := create(t, conf, migrator)
-	return db
+	instance := Custom(t, conf, migrator)
+	if t.Failed() {
+		return nil
+	}
+	conn, err := instance.Connect()
+	if err != nil {
+		t.Fatalf("could not connect to test database: %s", err)
+		return nil
+	}
+	t.Cleanup(func() {
+		if err := conn.Close(); err != nil {
+			t.Fatalf("could not close test database connection: %s", err)
+		}
+	})
+	return conn
 }
 
 // Custom is like [New] but after creating the new database instance, it closes
@@ -154,29 +171,28 @@ func New(t TB, conf Config, migrator Migrator) *sql.DB {
 // interface.
 func Custom(t TB, conf Config, migrator Migrator) *Config {
 	t.Helper()
-	config, db := create(t, conf, migrator)
-	// Close `*sql.DB` connection that was opened during the creation process so
-	// that it the caller can connect to the database in any method of their
-	// choosing without interference from this existing connection.
-	if err := db.Close(); err != nil {
-		t.Fatalf("could not close test database: '%s': %s", config.Database, err)
+	db, err := Create(conf, migrator)
+	if err != nil {
+		t.Fatalf("could not create test database: %s", err)
 		return nil // unreachable
 	}
-	return config
+	t.Cleanup(func() {
+		if t.Failed() {
+			return
+		}
+		if err := db.Cleanup(); err != nil {
+			t.Fatalf(err.Error())
+		}
+	})
+	return db
 }
 
-// create contains the implementation of [New] and [Custom], and is responsible
-// for actually creating the instance database to be used by a testcase.
-//
-// create will use at most one connection to the underlying database at any
-// given time.
-func create(t TB, conf Config, migrator Migrator) (*Config, *sql.DB) {
-	t.Helper()
+// Create creates a new database instance by cloning a template.
+func Create(conf Config, migrator Migrator) (*Config, error) {
 	ctx := context.Background()
 	baseDB, err := conf.Connect()
 	if err != nil {
-		t.Fatalf("could not connect to database: %s", err)
-		return nil, nil // unreachable
+		return nil, fmt.Errorf("could not connect to database: %w", err)
 	}
 
 	// From this point onward, all functions assume that `conf.TestRole` is not nil.
@@ -186,83 +202,66 @@ func create(t TB, conf Config, migrator Migrator) (*Config, *sql.DB) {
 		conf.TestRole = &role
 	}
 	if err := ensureUser(ctx, baseDB, conf); err != nil {
-		t.Fatalf("could not create pgtestdb user: %s", err)
-		return nil, nil // unreachable
+		return nil, fmt.Errorf("could not create pgtestdb user: %w", err)
 	}
 
 	template, err := getOrCreateTemplate(ctx, baseDB, conf, migrator)
 	if err != nil {
-		t.Fatalf("%s", err)
-		return nil, nil // unreachable
+		return nil, err
 	}
 
 	instance, err := createInstance(ctx, baseDB, *template)
 	if err != nil {
-		t.Fatalf("failed to create instance: %s", err)
-		return nil, nil // unreachable
+		return nil, fmt.Errorf("failed to create instance: %w", err)
 	}
-	t.Logf("testdbconf: %s", instance.URL())
-
-	db, err := instance.Connect()
-	if err != nil {
-		t.Fatalf("failed to connect to instance: %s", err)
-		return nil, nil // unreachable
+	if conf.Logf != nil {
+		conf.Logf("testdbconf: %s", instance.URL())
 	}
 
 	if err := baseDB.Close(); err != nil {
-		t.Fatalf("could not close base database: '%s': %s", conf.Database, err)
-		return nil, nil // unreachable
+		return nil, fmt.Errorf("could not close base database: '%s': %w", conf.Database, err)
 	}
 
-	t.Cleanup(func() {
-		// Close the testDB
-		if err := db.Close(); err != nil {
-			t.Fatalf("could not close test database: '%s': %s", instance.Database, err)
-			return // unreachable
-		}
+	return instance, nil
+}
 
-		// If the test failed, leave the instance around for further investigation
-		if t.Failed() {
-			return
-		}
+// Cleanup drops the test database. If ForceTerminateConnections is true, it will
+// also terminate any open connections to the database before dropping it.
+func (c Config) Cleanup() error {
+	baseDB, err := c.Connect()
+	if err != nil {
+		return fmt.Errorf("could not connect to database: '%s': %s", c.Database, err)
+	}
 
-		// Otherwise, reconnect to the basedb and remove the instance from the server
-		baseDB, err := conf.Connect()
-		if err != nil {
-			t.Fatalf("could not connect to database: '%s': %s", conf.Database, err)
-			return
-		}
-
-		if conf.ForceTerminateConnections {
-			termConnections := fmt.Sprintf(`SELECT pg_terminate_backend(pg_stat_activity.pid)
+	if c.ForceTerminateConnections {
+		termConnections := fmt.Sprintf(`SELECT pg_terminate_backend(pg_stat_activity.pid)
 				FROM pg_stat_activity
 				WHERE pg_stat_activity.datname = '%s'
-				AND pid <> pg_backend_pid();`, instance.Database)
-			if _, err := baseDB.ExecContext(ctx, termConnections); err != nil {
-				t.Fatalf("could not terminate open connections on database '%s': %w",
-					instance.Database, err)
-				return // unreachable
-			}
+				AND pid <> pg_backend_pid();`, c.Database)
+		_, err = baseDB.ExecContext(context.Background(), termConnections)
+		if err != nil {
+			return fmt.Errorf("could not terminate open connections on database '%s': %w", c.Database, err)
 		}
+	}
 
-		query := fmt.Sprintf(`DROP DATABASE IF EXISTS "%s"`, instance.Database)
-		if _, err := baseDB.ExecContext(ctx, query); err != nil {
-			if !conf.ForceTerminateConnections {
-				t.Logf("pgtestdb failed to clean up the test database because there are still open connections to it.")
-				t.Logf("This usually means that your code is leaking database connections, which is usually bad.")
-				t.Logf("If you would like pgtestdb to force-terminate any open connections at the end of the testcase, set `ForceTerminateConnections = true` on your `pgtestdb.Config`")
-			}
-			t.Fatalf("could not drop test database '%s': %s", instance.Database, err)
-			return // unreachable
+	query := fmt.Sprintf(`DROP DATABASE IF EXISTS "%s"`, c.Database)
+	_, err = baseDB.ExecContext(context.Background(), query)
+	if err != nil {
+		if !c.ForceTerminateConnections {
+			return fmt.Errorf(
+				"pgtestdb failed to clean up the test database because there are still open connections to it. " +
+					"This usually means that your code is leaking database connections, which is usually bad. " +
+					"If you would like pgtestdb to force-terminate any open connections at the end of the testcase, " +
+					"set `ForceTerminateConnections = true` on your `pgtestdb.Config`",
+			)
 		}
+		return fmt.Errorf("could not drop test database '%s': %w", c.Database, err)
+	}
 
-		if err := baseDB.Close(); err != nil {
-			t.Fatalf("could not close base database: '%s': %s", conf.Database, err)
-			return // unreachable
-		}
-	})
-
-	return instance, db
+	if err := baseDB.Close(); err != nil {
+		return fmt.Errorf("could not close base database: '%s': %w", c.Database, err)
+	}
+	return nil
 }
 
 // user is used to guarantee that each testdb user/role is only get-or-created
@@ -282,7 +281,7 @@ func ensureUser(
 		return nil, sessionlock.With(ctx, baseDB, username, func(conn *sql.Conn) error {
 			// Get-or-create a role/user dedicated to connecting to these test databases.
 			var roleExists bool
-			query := "SELECT EXISTS (SELECT from pg_catalog.pg_roles WHERE rolname = $1)"
+			query := "SELECT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = $1)"
 			if err := conn.QueryRowContext(ctx, query, username).Scan(&roleExists); err != nil {
 				return fmt.Errorf("failed to detect if role %s exists: %w", username, err)
 			}
@@ -390,7 +389,7 @@ func ensureTemplate(
 	// If the template database already exists, and is marked as a template,
 	// there is no more work to be done.
 	var templateExists bool
-	query := "SELECT EXISTS (SELECT FROM pg_database WHERE datname = $1 AND datistemplate = true)"
+	query := "SELECT EXISTS (SELECT FROM pg_database WHERE datname = $1 AND datistemplate = TRUE)"
 	if err := conn.QueryRowContext(ctx, query, state.conf.Database).Scan(&templateExists); err != nil {
 		return fmt.Errorf("failed to check if template %s already exists: %w", state.conf.Database, err)
 	}
@@ -428,7 +427,7 @@ func ensureTemplate(
 
 	// Finalize the creation of the template by marking it as a
 	// template.
-	query = "UPDATE pg_database SET datistemplate = true WHERE datname=$1"
+	query = "UPDATE pg_database SET datistemplate = TRUE WHERE datname=$1"
 	if _, err := conn.ExecContext(ctx, query, state.conf.Database); err != nil {
 		return fmt.Errorf("failed to confirm template %s: %w", state.conf.Database, err)
 	}
