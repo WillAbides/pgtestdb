@@ -171,6 +171,9 @@ func New(t TB, conf Config, migrator Migrator) *sql.DB {
 // interface.
 func Custom(t TB, conf Config, migrator Migrator) *Config {
 	t.Helper()
+	if conf.Logf == nil {
+		conf.Logf = t.Logf
+	}
 	db, err := Create(conf, migrator)
 	if err != nil {
 		t.Fatalf("could not create test database: %s", err)
@@ -230,7 +233,7 @@ func Create(conf Config, migrator Migrator) (*Config, error) {
 func (c Config) Cleanup() error {
 	baseDB, err := c.Connect()
 	if err != nil {
-		return fmt.Errorf("could not connect to database: '%s': %s", c.Database, err)
+		return fmt.Errorf("could not connect to database: '%s': %w", c.Database, err)
 	}
 
 	if c.ForceTerminateConnections {
